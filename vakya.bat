@@ -6,8 +6,9 @@ color 0F
 echo.
 echo  ╔══════════════════════════════════════════════════════════╗
 echo  ║                                                          ║
-echo  ║   Vakya Control Center (वाक्य नियन्त्रण केन्द्र)         ║
-echo  ║   Open Protocol for AI-to-AI Communication               ║
+echo  ║   Vakya Control Center v2.0                               ║
+echo  ║   Live AI APIs + Cross-IDE + Multi-Model Chat             ║
+echo  ║   OpenAI / Anthropic / Ollama / Gemini                    ║
 echo  ║                                                          ║
 echo  ╚══════════════════════════════════════════════════════════╝
 echo.
@@ -30,10 +31,13 @@ echo.
 
 :: Check command line args
 set ARGS=
-if "%1"=="--demo" set ARGS=--demo
-if "%1"=="demo"   set ARGS=--demo
-if "%2"=="--demo" set ARGS=%ARGS% --demo
-if "%1"=="--port" set ARGS=%ARGS% --port %2
+if "%1"=="--demo"  set ARGS=--demo
+if "%1"=="demo"    set ARGS=--demo
+if "%1"=="--auto"  set ARGS=--auto
+if "%1"=="auto"    set ARGS=--auto
+if "%2"=="--demo"  set ARGS=%ARGS% --demo
+if "%2"=="--auto"  set ARGS=%ARGS% --auto
+if "%1"=="--port"  set ARGS=%ARGS% --port %2
 
 :: Run the control center
 .venv\Scripts\python.exe vakya_control.py %ARGS%
