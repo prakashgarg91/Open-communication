@@ -13,6 +13,8 @@ Supported APIs:
     - Anthropic (Claude Opus, Sonnet, Haiku)
     - Ollama   (Local models — LLaMA, Mistral, etc.)
     - Google   (Gemini 2.0 Flash, Pro, etc.)
+    - Kimi CLI (Moonshot AI coding agent — subprocess)
+    - OpenCode CLI (GLM-4.7, multi-provider coding agent — subprocess)
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import subprocess
 import time
 from abc import ABC, abstractmethod
 from typing import Any
@@ -277,13 +281,25 @@ class AnthropicAgent(LiveAgent):
 
 # ─── Ollama Agent (Local) ────────────────────────────────────────────────────
 
+# Embedding models should not be used for chat
+OLLAMA_EMBED_KEYWORDS = {"embed", "embedding", "nomic-embed", "mxbai-embed", "bge-", "e5-"}
+
+
+def _is_chat_model(name: str) -> bool:
+    """Return True if an Ollama model is a chat model (not embedding)."""
+    lower = name.lower()
+    return not any(kw in lower for kw in OLLAMA_EMBED_KEYWORDS)
+
+
 class OllamaAgent(LiveAgent):
     """Live agent connected to local Ollama instance."""
 
-    def __init__(self, model: str = "llama3.1", host: str = "http://localhost:11434"):
+    def __init__(self, model: str = "auto", host: str = "http://localhost:11434"):
+        # Short display name (strip :latest but keep :cloud etc.)
+        display = model.replace(":latest", "") if model != "auto" else model
         duta = Duta(
-            name=f"Ollama ({model})",
-            model=model,
+            name=f"Ollama ({display})",
+            model=model,  # Will be resolved to full tag in connect()
             provider="ollama",
             role=DutaRole.KARTR,
             skills=["code-generation", "analysis"],
@@ -299,24 +315,46 @@ class OllamaAgent(LiveAgent):
                     f"{self.host}/api/tags",
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        models = [m["name"].split(":")[0] for m in data.get("models", [])]
-                        if self.duta.model in models or any(self.duta.model in m for m in models):
-                            self.connected = True
-                        elif models:
-                            # Auto-select first available model
-                            old_model = self.duta.model
-                            self.duta.model = models[0]
-                            self.duta.name = f"Ollama ({models[0]})"
-                            logger.info(f"Ollama: '{old_model}' not found, using '{models[0]}'")
-                            self.connected = True
-                        else:
-                            logger.warning("Ollama: running but no models installed")
-                            self.connected = False
-                    else:
+                    if resp.status != 200:
                         self.connected = False
-                    return self.connected
+                        return False
+
+                    data = await resp.json()
+                    # Full names with tags (e.g. 'kimi-k2.5:cloud', 'glm-4.7-flash:latest')
+                    all_models = [m["name"] for m in data.get("models", [])]
+                    chat_models = [m for m in all_models if _is_chat_model(m)]
+
+                    if not chat_models:
+                        logger.warning("Ollama: running but no chat models installed")
+                        self.connected = False
+                        return False
+
+                    wanted = self.duta.model
+
+                    if wanted == "auto":
+                        # Auto-select first chat model
+                        self._set_model(chat_models[0])
+                        self.connected = True
+                        return True
+
+                    # Try exact match first → then base-name match
+                    for full in chat_models:
+                        if full == wanted or full.split(":")[0] == wanted:
+                            self._set_model(full)
+                            self.connected = True
+                            return True
+
+                    # Fuzzy: substring match
+                    for full in chat_models:
+                        if wanted.lower() in full.lower() or full.split(":")[0].lower() in wanted.lower():
+                            self._set_model(full)
+                            self.connected = True
+                            return True
+
+                    logger.warning(f"Ollama: model '{wanted}' not found. Available: {chat_models}")
+                    self.connected = False
+                    return False
+
         except aiohttp.ClientConnectorError:
             logger.warning("Ollama: not running (connection refused)")
             self.connected = False
@@ -325,6 +363,12 @@ class OllamaAgent(LiveAgent):
             logger.warning(f"Ollama connect error: {e}")
             self.connected = False
             return False
+
+    def _set_model(self, full_name: str):
+        """Set the model to the full Ollama tag name."""
+        self.duta.model = full_name
+        display = full_name.replace(":latest", "")
+        self.duta.name = f"Ollama ({display})"
 
     async def chat(self, message: str, system: str | None = None) -> str:
         self.add_to_history("user", message)
@@ -432,6 +476,208 @@ class GeminiAgent(LiveAgent):
             return f"[Gemini Error]: {e}"
 
 
+# ─── Kimi CLI Agent (Subprocess) ─────────────────────────────────────────────
+
+class KimiCLIAgent(LiveAgent):
+    """
+    Live agent that runs Kimi CLI as a subprocess.
+    Kimi CLI is a coding agent from Moonshot AI — similar to Claude Code.
+    It runs in --print mode (non-interactive) with --final-message-only.
+    """
+
+    def __init__(self, work_dir: str = "", model: str = ""):
+        duta = Duta(
+            name="Kimi CLI",
+            model=model or "kimi-k2.5",
+            provider="kimi",
+            role=DutaRole.KARTR,
+            skills=["code-generation", "analysis", "file-editing", "testing"],
+        )
+        env = IDEEnvironment(ide_type=IDEType.TERMINAL, ide_name="Kimi CLI")
+        super().__init__(duta, env)
+        self.work_dir = work_dir or os.getcwd()
+        self._kimi_path = shutil.which("kimi") or "kimi"
+
+    async def connect(self) -> bool:
+        """Verify kimi CLI is available."""
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [self._kimi_path, "--version"],
+                    capture_output=True, text=True, timeout=10,
+                ),
+            )
+            if result.returncode == 0 and "kimi" in result.stdout.lower():
+                version = result.stdout.strip().split("\n")[0]
+                self.duta.name = f"Kimi CLI ({version})"
+                self.connected = True
+                logger.info(f"Kimi CLI connected: {version}")
+                return True
+            self.connected = False
+            return False
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+            logger.warning(f"Kimi CLI connect error: {e}")
+            self.connected = False
+            return False
+
+    async def chat(self, message: str, system: str | None = None) -> str:
+        """Run kimi CLI with a prompt and return the output."""
+        self.add_to_history("user", message)
+
+        cmd = [
+            self._kimi_path,
+            "--print",
+            "--final-message-only",
+            "--work-dir", self.work_dir,
+            "--prompt", message,
+        ]
+
+        if system:
+            # Prepend system context to the prompt
+            cmd[-1] = f"[Context: {system}]\n\n{message}"
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    cmd,
+                    capture_output=True, text=True,
+                    timeout=300,  # 5 min max for complex tasks
+                    cwd=self.work_dir,
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                ),
+            )
+            self.last_latency = time.monotonic() - t0
+            self.request_count += 1
+
+            if result.returncode == 0:
+                reply = result.stdout.strip()
+                if not reply and result.stderr.strip():
+                    reply = f"(stderr output)\n{result.stderr.strip()[:500]}"
+                if not reply:
+                    reply = "(Kimi CLI returned no output)"
+                self.add_to_history("assistant", reply)
+                # Estimate tokens (rough: ~4 chars per token)
+                self.total_tokens += len(reply) // 4
+                return reply
+            else:
+                error = result.stderr.strip()[:500] or result.stdout.strip()[:500]
+                return f"[Kimi CLI Error (exit {result.returncode})]: {error}"
+
+        except subprocess.TimeoutExpired:
+            self.last_latency = time.monotonic() - t0
+            return "[Kimi CLI Error]: Command timed out (5 min limit)"
+        except FileNotFoundError:
+            return "[Kimi CLI Error]: kimi command not found. Install: pip install kimi-cli"
+        except Exception as e:
+            self.last_latency = time.monotonic() - t0
+            return f"[Kimi CLI Error]: {e}"
+
+
+# ─── OpenCode CLI Agent (Subprocess) ─────────────────────────────────────────
+
+class OpenCodeCLIAgent(LiveAgent):
+    """
+    Live agent that runs OpenCode CLI as a subprocess.
+    OpenCode is a coding agent that supports multiple providers/models
+    including free GLM models (opencode/glm-4.7-free).
+
+    Usage: opencode run -m <model> "prompt"
+    """
+
+    def __init__(self, work_dir: str = "", model: str = "zai-coding-plan/glm-4.7"):
+        duta = Duta(
+            name="OpenCode (GLM-4.7)",
+            model=model,
+            provider="opencode",
+            role=DutaRole.KARTR,
+            skills=["code-generation", "analysis", "file-editing", "testing"],
+        )
+        env = IDEEnvironment(ide_type=IDEType.OPENCODE, ide_name="OpenCode")
+        super().__init__(duta, env)
+        self.work_dir = work_dir or os.getcwd()
+        self._opencode_path = shutil.which("opencode") or "opencode"
+        self._model = model
+
+    async def connect(self) -> bool:
+        """Verify opencode CLI is available."""
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [self._opencode_path, "--version"],
+                    capture_output=True, text=True, timeout=10,
+                ),
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                version = result.stdout.strip().split("\n")[0]
+                model_short = self._model.split("/")[-1] if "/" in self._model else self._model
+                self.duta.name = f"OpenCode v{version} ({model_short})"
+                self.connected = True
+                logger.info(f"OpenCode CLI connected: v{version}, model: {self._model}")
+                return True
+            self.connected = False
+            return False
+        except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+            logger.warning(f"OpenCode CLI connect error: {e}")
+            self.connected = False
+            return False
+
+    async def chat(self, message: str, system: str | None = None) -> str:
+        """Run opencode with a prompt and return the output."""
+        self.add_to_history("user", message)
+
+        prompt = message
+        if system:
+            prompt = f"[Context: {system}]\n\n{message}"
+
+        cmd = [
+            self._opencode_path, "run",
+            "-m", self._model,
+            prompt,
+        ]
+
+        t0 = time.monotonic()
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    cmd,
+                    capture_output=True, text=True,
+                    timeout=300,  # 5 min max
+                    cwd=self.work_dir,
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                ),
+            )
+            self.last_latency = time.monotonic() - t0
+            self.request_count += 1
+
+            if result.returncode == 0 or (result.stdout.strip() and result.returncode == 1):
+                # opencode may exit 1 even on success (stderr noise)
+                reply = result.stdout.strip()
+                if not reply and result.stderr.strip():
+                    reply = f"(stderr output)\n{result.stderr.strip()[:500]}"
+                if not reply:
+                    reply = "(OpenCode returned no output)"
+                self.add_to_history("assistant", reply)
+                self.total_tokens += len(reply) // 4
+                return reply
+            else:
+                error = result.stderr.strip()[:500] or result.stdout.strip()[:500]
+                return f"[OpenCode Error (exit {result.returncode})]: {error}"
+
+        except subprocess.TimeoutExpired:
+            self.last_latency = time.monotonic() - t0
+            return "[OpenCode Error]: Command timed out (5 min limit)"
+        except FileNotFoundError:
+            return "[OpenCode Error]: opencode command not found. Install: https://opencode.ai"
+        except Exception as e:
+            self.last_latency = time.monotonic() - t0
+            return f"[OpenCode Error]: {e}"
+
+
 # ─── Environment Detection ───────────────────────────────────────────────────
 
 def detect_self() -> SelfAgent:
@@ -506,14 +752,54 @@ def detect_api_keys() -> dict[str, str]:
     return keys
 
 
-def create_agent(provider: str, api_key: str = "", model: str = "") -> LiveAgent | None:
+def create_agent(provider: str, api_key: str = "", model: str = "", work_dir: str = "") -> LiveAgent | None:
     """Factory to create a live agent for a given provider."""
     if provider == "openai":
         return OpenAIAgent(api_key, model or "gpt-4o")
     elif provider == "anthropic":
         return AnthropicAgent(api_key, model or "claude-sonnet-4-20250514")
     elif provider == "ollama":
-        return OllamaAgent(model or "llama3.1")
+        return OllamaAgent(model or "auto")
     elif provider == "gemini":
         return GeminiAgent(api_key, model or "gemini-2.0-flash")
+    elif provider == "kimi":
+        return KimiCLIAgent(work_dir=work_dir, model=model)
+    elif provider == "opencode":
+        return OpenCodeCLIAgent(work_dir=work_dir, model=model or "zai-coding-plan/glm-4.7")
     return None
+
+
+def discover_cli_agents() -> list[tuple[str, str]]:
+    """Discover available CLI coding agents on the system.
+    Returns list of (provider, path) tuples."""
+    agents = []
+    # Kimi CLI
+    kimi_path = shutil.which("kimi")
+    if kimi_path:
+        agents.append(("kimi", kimi_path))
+    # Claude Code
+    claude_path = shutil.which("claude")
+    if claude_path:
+        agents.append(("claude-code", claude_path))
+    # OpenCode
+    opencode_path = shutil.which("opencode")
+    if opencode_path:
+        agents.append(("opencode", opencode_path))
+    return agents
+
+
+async def discover_ollama_models(host: str = "http://localhost:11434") -> list[str]:
+    """Discover all chat-capable models available in local Ollama."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{host.rstrip('/')}/api/tags",
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                all_models = [m["name"] for m in data.get("models", [])]
+                return [m for m in all_models if _is_chat_model(m)]
+    except Exception:
+        return []

@@ -44,8 +44,12 @@ from vakya.bridge.khoj import Khoj, IDEEnvironment, IDEType
 from vakya.bridge.setu import Setu, SetuConfig
 from vakya.live import (
     LiveAgent, SelfAgent, OpenAIAgent, AnthropicAgent,
-    OllamaAgent, GeminiAgent,
-    detect_self, detect_api_keys, create_agent,
+    OllamaAgent, GeminiAgent, KimiCLIAgent, OpenCodeCLIAgent,
+    detect_self, detect_api_keys, create_agent, discover_ollama_models,
+    discover_cli_agents,
+)
+from vakya.hierarchy import (
+    WorkflowEngine, ProjectPlan, TaskItem, TaskStatus, ProjectStatus,
 )
 
 # ─── Terminal Colors (Windows compatible) ────────────────────────────────────
@@ -199,6 +203,10 @@ class ControlCenter:
         self.messages: list[dict] = []
         self._api_keys: dict[str, str] = {}
 
+        # Workflow engine
+        self.workflow: WorkflowEngine | None = None
+        self._workflow_task: asyncio.Task | None = None
+
     # ─── Self Detection ──────────────────────────────────────────────────
 
     def _detect_and_register_self(self):
@@ -261,21 +269,41 @@ class ControlCenter:
                 else:
                     print(f"{RED}failed{RESET}")
 
-        # Always try Ollama (no key needed)
-        if "ollama" not in self._api_keys:
-            print(f"  {ICONS['globe']} Checking Ollama (local)...", end=" ", flush=True)
-            ollama = OllamaAgent()
-            if await ollama.connect():
-                self._register_live_agent(ollama)
-                print(f"{GREEN}connected{RESET} ({ollama.duta.model})")
-                connected += 1
-            else:
-                print(f"{DIM}not running{RESET}")
+        # Always try Ollama — connect ALL available chat models
+        print(f"  {ICONS['globe']} Checking Ollama (local)...", end=" ", flush=True)
+        ollama_models = await discover_ollama_models()
+        if ollama_models:
+            print(f"{GREEN}{len(ollama_models)} model(s) found{RESET}")
+            for model_name in ollama_models:
+                agent = OllamaAgent(model=model_name)
+                if await agent.connect():
+                    self._register_live_agent(agent)
+                    display = model_name.replace(':latest', '')
+                    print(f"    {GREEN}●{RESET} {YELLOW}{display}{RESET}")
+                    connected += 1
+        else:
+            print(f"{DIM}not running{RESET}")
 
         if connected > 0:
             ok(f"{connected} live AI(s) connected")
         else:
             warn("No live AIs connected. Use 'connect <provider>' to add one.")
+
+        # Also discover CLI agents (kimi, claude-code, opencode)
+        cli_agents = discover_cli_agents()
+        for provider_name, path in cli_agents:
+            # Skip if already connected via Ollama
+            already = any(provider_name in a.duta.provider for a in self.live_agents.values())
+            if already:
+                continue
+            print(f"  {ICONS['globe']} Found CLI agent: {provider_name} at {path}...", end=" ", flush=True)
+            agent = create_agent(provider_name)
+            if agent and await agent.connect():
+                self._register_live_agent(agent)
+                print(f"{GREEN}connected{RESET} ({agent.duta.name})")
+                connected += 1
+            else:
+                print(f"{DIM}skipped{RESET}")
 
     def _register_live_agent(self, agent: LiveAgent):
         """Register a live API agent with the system."""
@@ -410,6 +438,162 @@ class ControlCenter:
         total_tokens = sum(a.total_tokens for a in live)
         status_line("Total Tokens", str(total_tokens))
 
+    # ─── Project Workflow ────────────────────────────────────────────────
+
+    async def _workflow_event(self, event: str, data: dict):
+        """Handle events from the WorkflowEngine for live display."""
+        ts = datetime.now().strftime("%H:%M:%S")
+
+        if event == "phase_start":
+            phase = data.get("phase", "?")
+            section(f"Workflow Phase: {phase}", "brain")
+            if "description" in data:
+                print(f"  {DIM}{data['description'][:80]}{RESET}")
+
+        elif event == "plan_ready":
+            ok(f"Plan created with {data['task_count']} tasks:")
+            for tid, title in data.get("tasks", []):
+                print(f"    {CYAN}{tid}.{RESET} {title}")
+
+        elif event == "plan_failed":
+            err(f"Planning failed. Raw output: {data.get('raw', '?')[:200]}")
+
+        elif event == "task_start":
+            worker = data.get("worker", "?")
+            title = data.get("title", "?")
+            attempt = data.get("attempt", 1)
+            color = YELLOW if attempt == 1 else RED
+            attempt_str = f" (attempt {attempt})" if attempt > 1 else ""
+            print(f"\n  {DIM}{ts}{RESET} {ICONS['task']} "
+                  f"{color}Task {data.get('task_id', '?')}{RESET}: {title}")
+            print(f"           {DIM}→ assigned to{RESET} {BOLD}{worker}{RESET}{attempt_str}")
+
+        elif event == "task_done":
+            worker = data.get("worker", "?")
+            elapsed = data.get("time", 0)
+            preview = data.get("result_preview", "")[:100].replace("\n", " ")
+            print(f"  {DIM}{ts}{RESET} {GREEN}✓{RESET} {worker} completed "
+                  f"{DIM}({elapsed:.1f}s){RESET}")
+            if preview:
+                print(f"           {DIM}{preview}...{RESET}")
+
+        elif event == "review_start":
+            print(f"  {DIM}{ts}{RESET} {ICONS['eye']} Reviewing task {data.get('task_id', '?')}...",
+                  end=" ", flush=True)
+
+        elif event == "review_done":
+            approved = data.get("approved", False)
+            score = data.get("score", "?")
+            feedback = data.get("feedback", "")[:80]
+            if approved:
+                print(f"{GREEN}approved{RESET} (score: {score}/10)")
+            else:
+                print(f"{RED}needs revision{RESET} (score: {score}/10)")
+                if feedback:
+                    print(f"           {DIM}Feedback: {feedback}{RESET}")
+
+        elif event == "task_revision":
+            print(f"  {DIM}{ts}{RESET} {YELLOW}↻{RESET} Revising task {data.get('task_id', '?')} "
+                  f"(attempt {data.get('attempt', '?')})")
+
+        elif event == "task_max_attempts":
+            warn(f"Task {data.get('task_id', '?')} accepted after {data.get('attempts', '?')} attempts")
+
+        elif event == "project_done":
+            done = data.get("completed", 0)
+            total = data.get("total_tasks", 0)
+            elapsed = data.get("total_time", 0)
+            tokens = data.get("total_tokens", 0)
+            print()
+            section("Project Complete", "check")
+            status_line("Tasks completed", f"{done}/{total}")
+            status_line("Total time", f"{elapsed:.1f}s")
+            status_line("Total tokens", str(tokens))
+
+    async def run_project(self, description: str):
+        """Run a full automated AI project workflow."""
+        # Get worker agents (all live, non-self)
+        workers = [a for a in self.live_agents.values()
+                   if a.connected and not isinstance(a, SelfAgent)]
+
+        if not workers:
+            err("No worker AIs connected. Use 'connect ollama' first.")
+            return
+
+        # Pick planner: prefer cloud/powerful model, fallback to first worker
+        planner = workers[0]
+        for w in workers:
+            # Prefer cloud models (more powerful) for planning
+            if ":cloud" in w.duta.model:
+                planner = w
+                break
+            # Or models with "review" skill
+            if "review" in w.duta.skills or "analysis" in w.duta.skills:
+                planner = w
+
+        section("Starting Automated Project", "brain")
+        status_line("Project", description[:60])
+        status_line("Planner (Leader)", planner.duta.name, MAGENTA)
+        status_line("Workers", ", ".join(w.duta.name for w in workers), CYAN)
+        print()
+
+        self.workflow = WorkflowEngine(
+            planner=planner,
+            workers=workers,
+            on_event=self._workflow_event,
+        )
+
+        result = await self.workflow.run(description)
+
+        if result.status == ProjectStatus.DONE and result.final_output:
+            section("Final Deliverable", "star")
+            # Print final output with word wrap
+            for line in result.final_output.split("\n"):
+                if len(line) > 80:
+                    while len(line) > 80:
+                        idx = line[:80].rfind(" ")
+                        if idx < 20:
+                            idx = 80
+                        print(f"  {line[:idx]}")
+                        line = line[idx:].lstrip()
+                    if line:
+                        print(f"  {line}")
+                else:
+                    print(f"  {line}")
+        elif result.status == ProjectStatus.FAILED:
+            err("Project workflow failed. Check above for details.")
+        elif result.status == ProjectStatus.STOPPED:
+            warn("Project was stopped by user.")
+
+    def show_project_status(self):
+        """Display current project status."""
+        if not self.workflow or not self.workflow.project:
+            warn("No active project. Use 'project <description>' to start one.")
+            return
+
+        s = self.workflow.status_summary()
+        section(f"Project Status: {s['status'].upper()}", "task")
+        status_line("Description", s["description"])
+        status_line("Tasks", f"{s['tasks_done']}/{s['tasks_total']} done, "
+                    f"{s['tasks_running']} running, {s['tasks_pending']} pending")
+        status_line("Tokens", str(s["total_tokens"]))
+        status_line("Elapsed", s["elapsed"])
+
+        if self.workflow.project:
+            print()
+            for t in self.workflow.project.tasks:
+                icon = {
+                    TaskStatus.DONE: f"{GREEN}✓{RESET}",
+                    TaskStatus.RUNNING: f"{YELLOW}▶{RESET}",
+                    TaskStatus.REVIEW: f"{CYAN}◉{RESET}",
+                    TaskStatus.PENDING: f"{DIM}○{RESET}",
+                    TaskStatus.FAILED: f"{RED}✗{RESET}",
+                    TaskStatus.REVISION: f"{YELLOW}↻{RESET}",
+                    TaskStatus.ASSIGNED: f"{BLUE}◆{RESET}",
+                }.get(t.status, "?")
+                assigned = f" → {t.assigned_to}" if t.assigned_to else ""
+                print(f"  {icon} {t.id}. {t.title}{DIM}{assigned}{RESET}")
+
     # ─── Dashboard ───────────────────────────────────────────────────────
 
     def show_dashboard(self):
@@ -474,11 +658,20 @@ class ControlCenter:
     def show_help(self):
         section("Commands", "star")
 
+        print(f"\n  {BOLD}{YELLOW}── Project Workflow (auto-loop) ──{RESET}")
+        cmds_project = [
+            ("project <description>",   "Start automated project (plan→execute→review→iterate)"),
+            ("project status",          "Show current project progress"),
+            ("project stop",            "Stop running project workflow"),
+        ]
+        for cmd, desc in cmds_project:
+            print(f"    {CYAN}{cmd:<32}{RESET} {desc}")
+
         print(f"\n  {BOLD}{YELLOW}── Live AI Chat ──{RESET}")
         cmds_chat = [
-            ("chat <agent> <message>",   "Chat with a live AI (e.g., chat openai explain async)"),
+            ("chat <agent> <message>",   "Chat with a live AI (e.g., chat kimi explain async)"),
             ("discuss <topic> [rounds]",  "Multi-AI roundtable discussion"),
-            ("connect <provider> [model]","Connect an API (openai/anthropic/ollama/gemini)"),
+            ("connect <provider> [model]","Connect an API (openai/anthropic/ollama/gemini/kimi/opencode)"),
             ("disconnect <agent>",        "Disconnect a live API agent"),
             ("apis",                      "Show all connected APIs and stats"),
             ("keys",                      "Show detected API keys"),
@@ -509,10 +702,12 @@ class ControlCenter:
             print(f"    {CYAN}{cmd:<32}{RESET} {desc}")
 
         print(f"\n  {BOLD}Examples:{RESET}")
-        print(f"    {DIM}vakya>{RESET} chat openai Write a Python fibonacci function")
-        print(f"    {DIM}vakya>{RESET} chat ollama Review this approach for auth")
-        print(f"    {DIM}vakya>{RESET} discuss \"Design a REST API for a todo app\" 3")
-        print(f"    {DIM}vakya>{RESET} connect anthropic claude-opus-4-20250514")
+        print(f"    {DIM}vakya>{RESET} project Build a REST API for todo app with FastAPI")
+        print(f"    {DIM}vakya>{RESET} chat kimi Write a Python fibonacci function")
+        print(f"    {DIM}vakya>{RESET} chat glm Review this approach for auth")
+        print(f"    {DIM}vakya>{RESET} connect kimi"
+              f"\n    {DIM}vakya>{RESET} connect opencode zai-coding-plan/glm-4.7")
+        print(f"    {DIM}vakya>{RESET} discuss \"Best approach for microservices\" 3")
 
     # ─── Command Handler ─────────────────────────────────────────────────
 
@@ -534,6 +729,25 @@ class ControlCenter:
         # ── Dashboard / Status ──
         elif cmd in ("dashboard", "d", "status"):
             self.show_dashboard()
+
+        # ── Project Workflow ──
+        elif cmd == "project":
+            if len(parts) < 2:
+                warn("Usage: project <description> | project status | project stop")
+                return True
+            subcmd = parts[1].lower()
+            if subcmd == "status":
+                self.show_project_status()
+            elif subcmd == "stop":
+                if self.workflow:
+                    self.workflow.stop()
+                    ok("Project workflow stop requested.")
+                else:
+                    warn("No active project.")
+            else:
+                # Everything after 'project' is the description
+                desc = line.strip()[len("project"):].strip().strip('"').strip("'")
+                await self.run_project(desc)
 
         # ── Chat with live AI ──
         elif cmd == "chat":
@@ -570,7 +784,7 @@ class ControlCenter:
         elif cmd == "connect":
             if len(parts) < 2:
                 warn("Usage: connect <provider> [model]")
-                print(f"  Providers: openai, anthropic, ollama, gemini")
+                print(f"  Providers: openai, anthropic, ollama, gemini, kimi")
                 return True
             await self._handle_connect(parts[1], parts[2] if len(parts) > 2 else "")
 
@@ -672,14 +886,14 @@ class ControlCenter:
 
     async def _handle_connect(self, provider: str, model: str = ""):
         provider = provider.lower()
-        valid = {"openai", "anthropic", "ollama", "gemini"}
+        valid = {"openai", "anthropic", "ollama", "gemini", "kimi", "opencode"}
         if provider not in valid:
             warn(f"Unknown provider: {provider}. Options: {', '.join(valid)}")
             return
 
-        # Check for API key
+        # Check for API key (not needed for ollama, kimi, opencode)
         key = ""
-        if provider != "ollama":
+        if provider not in ("ollama", "kimi", "opencode"):
             env_map = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY",
                        "gemini": "GOOGLE_API_KEY"}
             env_var = env_map.get(provider, "")
@@ -741,19 +955,30 @@ class ControlCenter:
         for aid, agent in self.live_agents.items():
             if isinstance(agent, SelfAgent):
                 continue
+            # Match against name, provider, model (with and without tag)
+            model_base = agent.duta.model.split(":")[0].lower()
             if name_lower in agent.duta.name.lower():
                 return agent
             if name_lower in agent.duta.provider.lower():
                 return agent
             if name_lower in agent.duta.model.lower():
                 return agent
+            if name_lower in model_base:
+                return agent
+            # Partial match: "kimi" matches "kimi-k2.5", "glm" matches "glm-4.7-flash"
+            if model_base.startswith(name_lower):
+                return agent
             if aid.startswith(name):
                 return agent
         return None
 
     def _list_live_names(self) -> list[str]:
-        return [a.duta.provider for a in self.live_agents.values()
-                if a.connected and not isinstance(a, SelfAgent)]
+        names = []
+        for a in self.live_agents.values():
+            if a.connected and not isinstance(a, SelfAgent):
+                model_short = a.duta.model.split(":")[0].replace(":latest", "")
+                names.append(model_short)
+        return names
 
     def _show_agents(self):
         if not self.agents:
@@ -912,11 +1137,14 @@ class ControlCenter:
         section("Interactive Control", "gear")
         live_count = sum(1 for a in self.live_agents.values()
                          if a.connected and not isinstance(a, SelfAgent))
+        live_names = self._list_live_names()
         if live_count > 0:
-            print(f"  {GREEN}{live_count} live AI(s) ready.{RESET} "
-                  f"Try: {CYAN}chat openai hello{RESET} or {CYAN}discuss \"your topic\"{RESET}")
+            names_str = ", ".join(live_names[:3])
+            print(f"  {GREEN}{live_count} live AI(s) ready:{RESET} {names_str}")
+            print(f"  Try: {CYAN}chat {live_names[0]} hello{RESET} or "
+                  f"{CYAN}project Build a todo app{RESET}")
         else:
-            print(f"  No live AIs yet. Use {CYAN}connect openai{RESET} or {CYAN}connect ollama{RESET}")
+            print(f"  No live AIs yet. Use {CYAN}connect ollama{RESET} or {CYAN}connect openai{RESET}")
         print(f"  Type {CYAN}help{RESET} for all commands, {CYAN}quit{RESET} to exit.\n")
 
         try:
